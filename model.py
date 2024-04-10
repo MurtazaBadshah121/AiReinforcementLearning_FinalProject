@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import os
+import random
+from collections import deque
 
 class Linear_QNet(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -23,49 +25,59 @@ class Linear_QNet(nn.Module):
         file_name = os.path.join(model_folder_path, file_name)
         torch.save(self.state_dict(), file_name)
 
+class ReplayMemory:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.memory = deque([], maxlen=capacity)
+
+    def push(self, event):
+        self.memory.append(event)
+
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
 
 class QTrainer:
-    def __init__(self, model, lr, gamma):
+    def __init__(self, model, lr, gamma, target_update, memory_size, batch_size):
         self.lr = lr
         self.gamma = gamma
+        self.batch_size = batch_size
         self.model = model
+        self.target_model = Linear_QNet(input_size=model.linear1.in_features, hidden_size=model.linear1.out_features, output_size=model.linear2.out_features)
+        self.update_target_model()
         self.optimizer = optim.Adam(model.parameters(), lr=self.lr)
         self.criterion = nn.MSELoss()
+        self.memory = ReplayMemory(memory_size)
+        self.target_update = target_update
+        self.update_count = 0
 
-    def train_step(self, state, action, reward, next_state, done):
-        state = torch.tensor(state, dtype=torch.float)
-        next_state = torch.tensor(next_state, dtype=torch.float)
-        action = torch.tensor(action, dtype=torch.long)
-        reward = torch.tensor(reward, dtype=torch.float)
-        # (n, x)
+    def update_target_model(self):
+        self.target_model.load_state_dict(self.model.state_dict())
 
-        if len(state.shape) == 1:
-            # (1, x)
-            state = torch.unsqueeze(state, 0)
-            next_state = torch.unsqueeze(next_state, 0)
-            action = torch.unsqueeze(action, 0)
-            reward = torch.unsqueeze(reward, 0)
-            done = (done, )
+    def train_step(self):
+        if len(self.memory.memory) < self.batch_size:
+            return
+        batch = self.memory.sample(self.batch_size)
+        batch_state, batch_action, batch_reward, batch_next_state, batch_done = zip(*batch)
 
-        # 1: predicted Q values with current state
-        pred = self.model(state)
+        batch_state = torch.tensor(batch_state, dtype=torch.float)
+        batch_next_state = torch.tensor(batch_next_state, dtype=torch.float)
+        batch_action = torch.tensor(batch_action, dtype=torch.long)
+        batch_reward = torch.tensor(batch_reward, dtype=torch.float)
+        batch_done = torch.tensor(batch_done, dtype=torch.bool)
 
-        target = pred.clone()
-        for idx in range(len(done)):
-            Q_new = reward[idx]
-            if not done[idx]:
-                Q_new = reward[idx] + self.gamma * torch.max(self.model(next_state[idx]))
+        current_q_values = self.model(batch_state).gather(1, batch_action.unsqueeze(1)).squeeze(1)
+        next_q_values = self.target_model(batch_next_state).max(1)[0].detach()
+        expected_q_values = batch_reward + self.gamma * next_q_values * (~batch_done)
 
-            target[idx][torch.argmax(action[idx]).item()] = Q_new
-    
-        # 2: Q_new = r + y * max(next_predicted Q value) -> only do this if not done
-        # pred.clone()
-        # preds[argmax(action)] = Q_new
+        loss = self.criterion(current_q_values, expected_q_values)
+
         self.optimizer.zero_grad()
-        loss = self.criterion(target, pred)
         loss.backward()
-
         self.optimizer.step()
+
+        self.update_count += 1
+        if self.update_count % self.target_update == 0:
+            self.update_target_model()
 
 
 
